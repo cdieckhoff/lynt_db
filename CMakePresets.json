@@ -1,0 +1,87 @@
+﻿{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 20,
+    "patch": 0
+  },
+
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "installDir": "${sourceDir}/build/install/${presetName}",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+
+    {
+      "name": "debug",
+      "displayName": "Debug (all platforms)",
+      "description": "Debug build with tests and error messages enabled",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "LYNT_BUILD_TESTS": "ON",
+        "LYNT_ERROR_MESSAGES": "ON",
+        "LYNT_ERROR_LOGGING": "OFF"
+      }
+    },
+
+    {
+      "name": "release",
+      "displayName": "Release (all platforms)",
+      "description": "Release build, tests off, error messages off",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "LYNT_BUILD_TESTS": "OFF",
+        "LYNT_ERROR_MESSAGES": "OFF",
+        "LYNT_ERROR_LOGGING": "OFF"
+      }
+    },
+
+    {
+      "name": "relwithdebinfo",
+      "displayName": "RelWithDebInfo (all platforms)",
+      "description": "Optimized with debug symbols",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "LYNT_BUILD_TESTS": "ON",
+        "LYNT_ERROR_MESSAGES": "ON"
+      }
+    }
+  ],
+
+  "buildPresets": [
+    {
+      "name": "debug",
+      "configurePreset": "debug"
+    },
+    {
+      "name": "release",
+      "configurePreset": "release"
+    },
+    {
+      "name": "relwithdebinfo",
+      "configurePreset": "relwithdebinfo"
+    }
+  ],
+
+  "testPresets": [
+    {
+      "name": "debug",
+      "configurePreset": "debug",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "relwithdebinfo",
+      "configurePreset": "relwithdebinfo",
+      "output": { "outputOnFailure": true }
+    }
+  ]
+}
