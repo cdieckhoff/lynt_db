@@ -6,10 +6,9 @@
  * --------
  * Phase 1 (core behavior):
  *   - File create / open / close round-trips
- *   - _m_size reflects the requested length exactly (the Windows
- *     granularity trap: a 16 KiB file must NOT report 64 KiB)
- *   - mmap at page-aligned offsets works on POSIX, and at
- *     granularity-aligned offsets works on Windows
+ *   - _m_size reflects the requested length exactly
+ *   - mmap at page-aligned offsets (POSIX) and granularity-aligned
+ *     offsets (Windows)
  *   - mmap past EOF extends the file (no SIGBUS on POSIX)
  *   - Growing a file preserves existing data
  *   - mmap write followed by read-back through pread
@@ -23,9 +22,19 @@
  *   - _m_sync round-trips data through close / reopen
  *   - _m_alloc returns pointers aligned to the requested boundary
  *
- * All temp files are created in the OS temp directory and cleaned up
- * at the end of each test. On failure, a message identifies the file
- * and offset for debugging.
+ * PLATFORM NOTES
+ * --------------
+ * Some tests are conditional or soft on platforms where the underlying
+ * OS or filesystem behaves differently:
+ *
+ *   - APFS (macOS) defers block allocation until fsync, so tests that
+ *     check "is this region allocated" call _m_sync first.
+ *
+ *   - FAT and exFAT don't support hole punching, so _m_punch_hole
+ *     returns _M_ERR_NOT_SUPPORTED and the test reports and skips.
+ *
+ *   - WSL's /mnt/c bridge (9P) has the same limitation, so tests run
+ *     there also degrade gracefully.
  */
 
 #include "test_harness.h"
@@ -39,11 +48,6 @@
   * Test fixture helpers
   * ==================================================================== */
 
-  /*
-   * Where temp files live. On POSIX, /tmp is always writable and is not
-   * subject to Windows's path-length or permission quirks. On Windows we
-   * use the temp directory reported by the OS.
-   */
 #ifdef _WIN32
 #  include <windows.h>
 static void get_temp_dir(char* out, size_t cap) {
@@ -62,10 +66,6 @@ static void get_temp_dir(char* out, size_t cap) {
 }
 #endif
 
-/*
- * Build a unique path for this test run. The suffix comes from the
- * process ID so parallel test runs don't collide.
- */
 static void make_temp_path(char* out, size_t cap, const char* suffix) {
     char dir[512];
     get_temp_dir(dir, sizeof(dir));
@@ -87,10 +87,6 @@ static void remove_file(const char* path) {
 #endif
 }
 
-/*
- * Query the OS file size directly, bypassing _m_size. Used to cross-check
- * that _m_size is not lying to us.
- */
 static int64_t os_file_size(const char* path) {
 #ifdef _WIN32
     WIN32_FILE_ATTRIBUTE_DATA fad;
@@ -99,7 +95,7 @@ static int64_t os_file_size(const char* path) {
     }
     LARGE_INTEGER li;
     li.HighPart = (LONG)fad.nFileSizeHigh;
-    li.LowPart = fad.nFileSizeLow;
+    li.LowPart = (LONG)fad.nFileSizeLow;
     return (int64_t)li.QuadPart;
 #else
     struct stat st;
@@ -108,10 +104,6 @@ static int64_t os_file_size(const char* path) {
 #endif
 }
 
-/*
- * Fill a buffer with a recognizable pattern so we can verify round-trips.
- * The pattern is position-dependent so we catch off-by-one errors.
- */
 static void fill_pattern(uint8_t* buf, size_t n, uint8_t seed) {
     for (size_t i = 0; i < n; i++) {
         buf[i] = (uint8_t)(seed + (i & 0xFF));
@@ -134,20 +126,13 @@ static void test_platform_info(void) {
     _m_size_t page = _m_page_size();
     _m_size_t gran = _m_alloc_granularity();
 
-    /* Page size must be a positive power of two. */
     TEST_ASSERT(page > 0);
     TEST_ASSERT((page & (page - 1)) == 0);
 
-    /* Granularity must be at least the page size, and a power of two. */
     TEST_ASSERT(gran > 0);
     TEST_ASSERT((gran & (gran - 1)) == 0);
     TEST_ASSERT(gran >= page);
 
-    /*
-     * On Windows, granularity is always 64 KiB. On POSIX, it equals
-     * page size. Asserting the Windows case catches accidental changes
-     * to the query function.
-     */
 #ifdef _WIN32
     TEST_ASSERT(gran == 65536);
 #else
@@ -162,10 +147,6 @@ static void test_platform_info(void) {
  * TEST: exact file size after truncate
  * ==================================================================== */
 
- /*
-  * This is the core test for the granularity bug. A file we asked to be
-  * 16 KiB must report 16 KiB via stat(), not 64 KiB, not 4 KiB.
-  */
 static void test_exact_truncate(void) {
     char path[512];
     make_temp_path(path, sizeof(path), "trunc.bin");
@@ -204,11 +185,6 @@ static void test_exact_truncate(void) {
  * TEST: mmap at 16 KiB boundaries
  * ==================================================================== */
 
- /*
-  * Map 16 KiB windows at every 16 KiB boundary. On Windows, some offsets
-  * are not granularity-aligned; the library maps at the nearest lower
-  * boundary and returns a pointer shifted into the mapping.
-  */
 static void test_mmap_16k_boundaries(void) {
     char path[512];
     make_temp_path(path, sizeof(path), "boundaries.bin");
@@ -236,7 +212,6 @@ static void test_mmap_16k_boundaries(void) {
         uint8_t* p = (uint8_t*)_m_mapping_addr((_m_mapping_t*)mp.ptr);
         TEST_ASSERT(p != NULL);
 
-        /* Tag each 16 KiB window with its index. */
         memset(p, (int)(off / 16384), 16384);
 
         r = _m_msync((_m_mapping_t*)mp.ptr);
@@ -246,7 +221,6 @@ static void test_mmap_16k_boundaries(void) {
         TEST_ASSERT(r.code == _M_OK);
     }
 
-    /* Read back and verify. */
     uint8_t* back = (uint8_t*)malloc(262144);
     r = _m_pread(h, back, 262144, 0);
     TEST_ASSERT(r.code == _M_OK);
@@ -326,7 +300,6 @@ static void test_mmap_roundtrip(void) {
     r = _m_truncate(h, 32768);
     TEST_ASSERT(r.code == _M_OK);
 
-    /* Map at 16 KiB, which is not granularity-aligned on Windows. */
     _m_ptr_result_t mp = _m_map(NULL, 16384,
         _M_PROT_READ | _M_PROT_WRITE,
         _M_MAP_SHARED, h, 16384);
@@ -346,7 +319,6 @@ static void test_mmap_roundtrip(void) {
     r = _m_unmap((_m_mapping_t*)mp.ptr);
     TEST_ASSERT(r.code == _M_OK);
 
-    /* Read back via pread, bypassing mmap. */
     uint8_t back[16384];
     r = _m_pread(h, back, 16384, 16384);
     TEST_ASSERT(r.code == _M_OK);
@@ -374,7 +346,6 @@ static void test_map_past_eof(void) {
     r = _m_truncate(h, 16384);
     TEST_ASSERT(r.code == _M_OK);
 
-    /* Map 16 KiB at offset 16384, past EOF. */
     _m_ptr_result_t mp = _m_map(NULL, 16384,
         _M_PROT_READ | _M_PROT_WRITE,
         _M_MAP_SHARED, h, 16384);
@@ -388,10 +359,8 @@ static void test_map_past_eof(void) {
 
     uint8_t* p = (uint8_t*)_m_mapping_addr((_m_mapping_t*)mp.ptr);
 
-    /* Fresh region reads as zeros. */
     for (int i = 0; i < 16384; i++) TEST_ASSERT(p[i] == 0);
 
-    /* Write extends the file. */
     fill_pattern(p, 16384, 0x11);
     _m_msync((_m_mapping_t*)mp.ptr);
     _m_unmap((_m_mapping_t*)mp.ptr);
@@ -412,19 +381,15 @@ static void test_map_past_eof(void) {
  * ==================================================================== */
 
 static void test_error_paths(void) {
-    /* NULL path. */
     _m_result_t r = _m_open(NULL, _M_O_RDWR, 0, false);
     TEST_ASSERT(r.code == _M_ERR_INVALID_ARG);
 
-    /* Nonexistent file without O_CREAT. */
     r = _m_open("/nonexistent/path/lynt_test", _M_O_RDWR, 0, false);
     TEST_ASSERT(r.code == _M_ERR_NOT_FOUND);
 
-    /* Invalid handle. */
     r = _m_close(_M_HANDLE_INVALID);
     TEST_ASSERT(r.code == _M_ERR_INVALID_ARG);
 
-    /* map with zero length. */
     char path[512];
     make_temp_path(path, sizeof(path), "err.bin");
     r = _m_open(path, _M_O_RDWR | _M_O_CREAT | _M_O_TRUNC, 0644, true);
@@ -438,7 +403,6 @@ static void test_error_paths(void) {
     }
     remove_file(path);
 
-    /* _m_last_error is never NULL. */
     TEST_ASSERT(_m_last_error() != NULL);
 }
 
@@ -448,12 +412,7 @@ static void test_error_paths(void) {
 
  /* --------------------------------------------------------------------
   * TEST: pwrite with a gap past EOF
-  * --------------------------------------------------------------------
-  * Write 4 KiB at offset 3 * 16 KiB into a 16 KiB file. This leaves a
-  * 32 KiB gap between the old EOF and the write offset. The file must
-  * grow to offset + 4096, the gap must read as zeros, and the written
-  * region must round-trip.
-  */
+  * -------------------------------------------------------------------- */
 static void test_pwrite_gap_past_eof(void) {
     char path[512];
     make_temp_path(path, sizeof(path), "gap.bin");
@@ -470,17 +429,15 @@ static void test_pwrite_gap_past_eof(void) {
     uint8_t wbuf[4096];
     fill_pattern(wbuf, sizeof(wbuf), 0x77);
 
-    const _m_size_t write_at = 3 * 16384;   /* 49152 */
+    const _m_size_t write_at = 3 * 16384;
     r = _m_pwrite(h, wbuf, 4096, write_at);
     TEST_ASSERT(r.code == _M_OK);
     TEST_ASSERT(r.value == 4096);
 
-    /* File is now write_at + 4096 = 53248. */
     r = _m_size(h);
     TEST_ASSERT(r.code == _M_OK);
     TEST_ASSERT(r.value == write_at + 4096);
 
-    /* The gap [16384, 32768) reads as zeros. */
     uint8_t gap[16384];
     memset(gap, 0xFF, sizeof(gap));
     r = _m_pread(h, gap, sizeof(gap), 16384);
@@ -496,7 +453,6 @@ static void test_pwrite_gap_past_eof(void) {
     }
     TEST_ASSERT(gap_nonzero == 0);
 
-    /* The written region reads back correctly. */
     uint8_t back[4096];
     r = _m_pread(h, back, sizeof(back), write_at);
     TEST_ASSERT(r.code == _M_OK);
@@ -515,13 +471,7 @@ static void test_pwrite_gap_past_eof(void) {
 
 /* --------------------------------------------------------------------
  * TEST: punch_hole actually deallocates
- * --------------------------------------------------------------------
- * Fill a 1 MiB file, measure allocated size, punch a 256 KiB hole in
- * the middle, measure again. On filesystems that support sparse files,
- * the allocated size drops by roughly the punched amount. On FAT/exFAT
- * and some network filesystems, punch_hole returns _M_ERR_NOT_SUPPORTED
- * and the test reports that gracefully.
- */
+ * -------------------------------------------------------------------- */
 static void test_punch_hole_deallocates(void) {
     char path[512];
     make_temp_path(path, sizeof(path), "punch.bin");
@@ -538,7 +488,6 @@ static void test_punch_hole_deallocates(void) {
     r = _m_truncate(h, total);
     TEST_ASSERT(r.code == _M_OK);
 
-    /* Write the whole file so it's fully allocated. */
     uint8_t buf[65536];
     fill_pattern(buf, sizeof(buf), 0x11);
     for (_m_size_t off = 0; off < total; off += 65536) {
@@ -552,7 +501,6 @@ static void test_punch_hole_deallocates(void) {
     _m_result_t before = _m_allocated_size(h);
     TEST_ASSERT(before.code == _M_OK);
 
-    /* Punch 256 KiB in the middle, aligned to granularity. */
     _m_size_t align = _m_alloc_granularity();
     _m_size_t punch_off = ((256 * 1024) / align) * align;
     _m_size_t punch_len = ((256 * 1024) / align) * align;
@@ -578,17 +526,11 @@ static void test_punch_hole_deallocates(void) {
         (long long)after.value,
         (long long)(before.value - after.value));
 
-    /*
-     * Soft assertion: on some filesystems (notably WSL's /mnt/c 9P
-     * bridge), the allocation doesn't visibly drop until the file is
-     * closed or the cache is flushed. We report but do not fail.
-     */
     if (after.value >= before.value) {
         printf("      NOTE: allocation did not decrease; FS may not "
             "report deallocation promptly\n");
     }
 
-    /* The punched region reads as zeros. */
     uint8_t back[65536];
     r = _m_pread(h, back, sizeof(back), punch_off);
     TEST_ASSERT(r.code == _M_OK);
@@ -598,7 +540,6 @@ static void test_punch_hole_deallocates(void) {
     }
     TEST_ASSERT(punched_nonzero == 0);
 
-    /* The rest of the file is intact. */
     r = _m_pread(h, back, 4096, 0);
     TEST_ASSERT(r.code == _M_OK);
     TEST_ASSERT(check_pattern(back, 4096, 0x11));
@@ -610,9 +551,10 @@ static void test_punch_hole_deallocates(void) {
 /* --------------------------------------------------------------------
  * TEST: is_hole on a fresh truncate and after a write
  * --------------------------------------------------------------------
- * A freshly-truncated file is a hole across its whole length, on
- * filesystems that support sparse files. After writing into a range,
- * that range is no longer a hole.
+ * Platform note: APFS on macOS uses deferred allocation. A write may
+ * not be reflected in the filesystem's allocation map until fsync is
+ * called. The test calls _m_sync before checking that a written range
+ * is no longer a hole, so the behavior is uniform across filesystems.
  */
 static void test_is_hole_fresh_truncate(void) {
     char path[512];
@@ -651,6 +593,11 @@ static void test_is_hole_fresh_truncate(void) {
     r = _m_pwrite(h, buf, 65536, 0);
     TEST_ASSERT(r.code == _M_OK);
 
+    /* Flush so the OS commits the allocation before we query it.
+     * On APFS, allocation is deferred until fsync. */
+    r = _m_sync(h);
+    TEST_ASSERT(r.code == _M_OK);
+
     /* The written range is not a hole. */
     r = _m_is_hole(h, 0, 65536, &is_hole);
     TEST_ASSERT(r.code == _M_OK);
@@ -662,10 +609,7 @@ static void test_is_hole_fresh_truncate(void) {
 
 /* --------------------------------------------------------------------
  * TEST: sync round-trip
- * --------------------------------------------------------------------
- * Write a pattern, sync, close, reopen, and verify. This proves that
- * _m_sync actually flushes data to the filesystem.
- */
+ * -------------------------------------------------------------------- */
 static void test_sync_roundtrip(void) {
     char path[512];
     make_temp_path(path, sizeof(path), "sync.bin");
@@ -690,7 +634,6 @@ static void test_sync_roundtrip(void) {
 
     _m_close(h);
 
-    /* Reopen and verify. */
     r = _m_open(path, _M_O_RDWR, 0, false);
     TEST_ASSERT(r.code == _M_OK);
     if (r.code != _M_OK) {
@@ -711,10 +654,7 @@ static void test_sync_roundtrip(void) {
 
 /* --------------------------------------------------------------------
  * TEST: alloc alignment
- * --------------------------------------------------------------------
- * Allocations must return pointers that are multiples of the requested
- * alignment. Invalid arguments are rejected cleanly.
- */
+ * -------------------------------------------------------------------- */
 static void test_alloc_alignment(void) {
     const _m_size_t alignments[] = { 16, 32, 64, 128, 256, 512, 1024, 4096 };
     const int n = (int)(sizeof(alignments) / sizeof(alignments[0]));
@@ -728,20 +668,16 @@ static void test_alloc_alignment(void) {
         uintptr_t p = (uintptr_t)r.ptr;
         TEST_ASSERT((p % (uintptr_t)a) == 0);
 
-        /* Write to prove it's usable memory. */
         memset(r.ptr, (int)a, 8192);
 
         _m_free(r.ptr);
     }
 
-    /* Free(NULL) is a no-op. */
     _m_free(NULL);
 
-    /* Zero alignment is rejected. */
     _m_ptr_result_t bad = _m_alloc(0, 4096);
     TEST_ASSERT(bad.code == _M_ERR_INVALID_ARG);
 
-    /* Zero size is rejected. */
     bad = _m_alloc(16, 0);
     TEST_ASSERT(bad.code == _M_ERR_INVALID_ARG);
 }
@@ -751,10 +687,6 @@ static void test_alloc_alignment(void) {
  * ==================================================================== */
 
 int main(void) {
-    /* Platform banner. Prints before the first test so CI logs and
-     * local terminal output make it obvious which environment this was
-     * captured in. Flushed immediately so the banner survives a crash.
-     */
 #ifdef _WIN32
     printf("== test_m on Windows ==\n");
 #elif defined(__APPLE__)

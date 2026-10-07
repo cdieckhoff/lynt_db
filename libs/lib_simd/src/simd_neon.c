@@ -2,22 +2,32 @@
  * @file simd_neon.c
  * @brief ARM64 NEON implementation of the SIMD API.
  *
- * Compiled only on aarch64 / ARM64 targets. NEON is guaranteed on
- * ARMv8-A, so no runtime detection is needed beyond the build-time
- * architecture check.
+ * Compiled only on aarch64 / ARM64 targets.
  *
- * Each primitive processes 128-bit vectors: 2 u64, 4 u32, 8 u16, or
- * 16 u8 per iteration. Similar throughput to SSE4.2 on x86.
+ * MASK EXTRACTION
+ * ---------------
+ * NEON has no movemask instruction. Extracting a scalar bitmask from
+ * a vector comparison requires reducing 0xFF/0x00 bytes to bits. The
+ * helper functions below do that with basic NEON operations only —
+ * no vshrn (GCC 13 aarch64 rejects constant shift arguments inside
+ * inline helpers) and no vqtbl (MSVC ARM64 has shown incorrect code
+ * generation on the Windows ARM runner).
  *
  * PORTABILITY NOTES
  * -----------------
- * Only compiled on ARM64. The <arm_neon.h> header is provided by every
- * compiler that targets ARM64: GCC, Clang, and MSVC's ARM64 toolchain.
- * The intrinsics used here are the base NEON set, not the optional
- * crypto or dot-product extensions, so no feature detection is needed.
+ * - The 64-bit compare builds its target vector as {lo, hi, lo, hi}
+ *   so each 64-bit lane of the vector matches the full target. Using
+ *   vdupq_n_u32(target) only sets the low 32 bits, which is why an
+ *   earlier version returned zero for find_u64 and cmp_u64.
  *
- * No __builtin_popcount. Clang supports it on ARM, but MSVC's ARM64
- * compiler does not, so we use a bit-twiddling helper for portability.
+ * - popcount uses vector SWAR rather than a nibble-lookup table. The
+ *   lookup approach relies on vqtbl1q_u8, which is available on
+ *   ARMv8-A but has produced incorrect results on some toolchains.
+ *
+ * - The horizontal sum in popcount widens uint8_t lanes to uint16_t
+ *   before reducing. vaddvq_u8 returns uint8_t and wraps modulo 256
+ *   when the total exceeds 255, which happens for any buffer longer
+ *   than about 64 bytes. Widening to u16 keeps the sum exact.
  */
 
 #include "simd/simd_internal.h"
@@ -28,13 +38,79 @@
 #include <string.h>
 
  /* ====================================================================
-  * Portable bit helpers
+  * Portable bit helpers (for the scalar tail)
   * ==================================================================== */
 
 static inline int simd_popcount8(uint8_t v) {
     v = (uint8_t)(v - ((v >> 1) & 0x55));
     v = (uint8_t)((v & 0x33) + ((v >> 2) & 0x33));
     return (int)((v + (v >> 4)) & 0x0F);
+}
+
+/* ====================================================================
+ * Mask extraction helpers
+ * ==================================================================== */
+
+static inline uint16_t neon_mask_u8(uint8x16_t eq) {
+    uint64_t lo = vgetq_lane_u64(vreinterpretq_u64_u8(eq), 0);
+    uint64_t hi = vgetq_lane_u64(vreinterpretq_u64_u8(eq), 1);
+
+    uint16_t mask = 0;
+    for (int i = 0; i < 8; i++) {
+        if ((lo >> (i * 8)) & 0x01) mask |= (uint16_t)1 << i;
+    }
+    for (int i = 0; i < 8; i++) {
+        if ((hi >> (i * 8)) & 0x01) mask |= (uint16_t)1 << (i + 8);
+    }
+    return mask;
+}
+
+static inline uint32_t neon_mask_u32(uint32x4_t eq) {
+    uint32_t a0 = vgetq_lane_u32(eq, 0) & 1;
+    uint32_t a1 = vgetq_lane_u32(eq, 1) & 1;
+    uint32_t a2 = vgetq_lane_u32(eq, 2) & 1;
+    uint32_t a3 = vgetq_lane_u32(eq, 3) & 1;
+    return a0 | (a1 << 1) | (a2 << 2) | (a3 << 3);
+}
+
+static inline uint32_t neon_mask_u16(uint16x8_t eq) {
+    uint64_t lo = vgetq_lane_u64(vreinterpretq_u64_u16(eq), 0);
+    uint64_t hi = vgetq_lane_u64(vreinterpretq_u64_u16(eq), 1);
+
+    uint32_t mask = 0;
+    for (int i = 0; i < 4; i++) {
+        if ((lo >> (i * 16)) & 0xFFFF) mask |= 1u << i;
+    }
+    for (int i = 0; i < 4; i++) {
+        if ((hi >> (i * 16)) & 0xFFFF) mask |= 1u << (i + 4);
+    }
+    return mask;
+}
+
+static inline uint32_t neon_mask_u64_pair(uint32x4_t eq_u32) {
+    uint64_t lo = vgetq_lane_u64(vreinterpretq_u64_u32(eq_u32), 0);
+    uint64_t hi = vgetq_lane_u64(vreinterpretq_u64_u32(eq_u32), 1);
+
+    uint32_t mask = 0;
+    if (lo == 0xFFFFFFFFFFFFFFFFULL) mask |= 1u;
+    if (hi == 0xFFFFFFFFFFFFFFFFULL) mask |= 2u;
+    return mask;
+}
+
+/**
+ * @brief Build a 4-lane uint32 vector holding {lo, hi, lo, hi} of a
+ *        64-bit value, so each 64-bit lane of the vector equals the
+ *        full value.
+ *
+ * This is what a 64-bit compare against a scalar needs. Using
+ * vdupq_n_u32(x) only sets the low 32 bits, which produces no matches
+ * on the high half of the comparison and returns zero.
+ */
+static inline uint32x4_t neon_u64_to_vec(uint64_t v) {
+    uint32_t lo = (uint32_t)(v & 0xFFFFFFFFu);
+    uint32_t hi = (uint32_t)(v >> 32);
+    uint32_t data[4] = { lo, hi, lo, hi };
+    return vld1q_u32(data);
 }
 
 /* ====================================================================
@@ -76,11 +152,8 @@ static uint64_t neon_find_u8(const uint8_t* buf, uint8_t target,
     for (; i + 16 <= n; i += 16) {
         uint8x16_t v = vld1q_u8(buf + i);
         uint8x16_t eq = vceqq_u8(v, tgt);
-        uint8x8_t narrowed = vshrn_n_u16(vreinterpretq_u16_u8(eq), 4);
-        uint64_t  bits = vget_lane_u64(vreinterpret_u64_u8(narrowed), 0);
-        for (int b = 0; b < 8; b++) {
-            if ((bits >> (b * 8)) & 0x0F) mask |= (uint64_t)1 << (i + b);
-        }
+        uint16_t bits = neon_mask_u8(eq);
+        mask |= (uint64_t)bits << i;
     }
 
     for (; i < n; i++) {
@@ -95,15 +168,13 @@ static uint64_t neon_find_u64(const uint64_t* buf, uint64_t target,
     size_t i = 0;
     size_t n = count < 64 ? count : 64;
 
-    uint32x4_t tgt = vdupq_n_u32((uint32_t)target);
+    uint32x4_t tgt = neon_u64_to_vec(target);
 
     for (; i + 2 <= n; i += 2) {
         uint32x4_t v = vld1q_u32((const uint32_t*)(buf + i));
         uint32x4_t eq = vceqq_u32(v, tgt);
-        uint64_t bits0 = vgetq_lane_u64(vreinterpretq_u64_u32(eq), 0);
-        uint64_t bits1 = vgetq_lane_u64(vreinterpretq_u64_u32(eq), 1);
-        if (bits0 == 0xFFFFFFFFFFFFFFFFULL) mask |= (uint64_t)1 << i;
-        if (bits1 == 0xFFFFFFFFFFFFFFFFULL) mask |= (uint64_t)1 << (i + 1);
+        uint32_t bits = neon_mask_u64_pair(eq);
+        mask |= (uint64_t)bits << i;
     }
 
     for (; i < n; i++) {
@@ -123,11 +194,8 @@ static uint64_t neon_find_u32(const uint32_t* buf, uint32_t target,
     for (; i + 4 <= n; i += 4) {
         uint32x4_t v = vld1q_u32(buf + i);
         uint32x4_t eq = vceqq_u32(v, tgt);
-        uint32x4_t shifted = vshrq_n_u32(eq, 31);
-        uint64_t bits = vgetq_lane_u64(vreinterpretq_u64_u32(shifted), 0);
-        for (int b = 0; b < 4; b++) {
-            if ((bits >> (b * 16)) & 1) mask |= (uint64_t)1 << (i + b);
-        }
+        uint32_t bits = neon_mask_u32(eq);
+        mask |= (uint64_t)bits << i;
     }
 
     for (; i < n; i++) {
@@ -147,11 +215,8 @@ static uint64_t neon_find_u16(const uint16_t* buf, uint16_t target,
     for (; i + 8 <= n; i += 8) {
         uint16x8_t v = vld1q_u16(buf + i);
         uint16x8_t eq = vceqq_u16(v, tgt);
-        uint8x8_t narrowed = vshrn_n_u16(eq, 8);
-        uint64_t bits = vget_lane_u64(vreinterpret_u64_u8(narrowed), 0);
-        for (int b = 0; b < 8; b++) {
-            if ((bits >> (b * 8)) & 1) mask |= (uint64_t)1 << (i + b);
-        }
+        uint32_t bits = neon_mask_u16(eq);
+        mask |= (uint64_t)bits << i;
     }
 
     for (; i < n; i++) {
@@ -164,7 +229,8 @@ static uint64_t neon_find_u16(const uint16_t* buf, uint16_t target,
  * Comparison primitives
  * ==================================================================== */
 
-static uint64_t neon_cmp_u8(const uint8_t* a, const uint8_t* b, size_t count) {
+static uint64_t neon_cmp_u8(const uint8_t* a, const uint8_t* b,
+    size_t count) {
     uint64_t mask = 0;
     size_t i = 0;
     size_t n = count < 64 ? count : 64;
@@ -173,11 +239,8 @@ static uint64_t neon_cmp_u8(const uint8_t* a, const uint8_t* b, size_t count) {
         uint8x16_t va = vld1q_u8(a + i);
         uint8x16_t vb = vld1q_u8(b + i);
         uint8x16_t eq = vceqq_u8(va, vb);
-        uint8x8_t narrowed = vshrn_n_u16(vreinterpretq_u16_u8(eq), 4);
-        uint64_t bits = vget_lane_u64(vreinterpret_u64_u8(narrowed), 0);
-        for (int k = 0; k < 8; k++) {
-            if ((bits >> (k * 8)) & 0x0F) mask |= (uint64_t)1 << (i + k);
-        }
+        uint16_t bits = neon_mask_u8(eq);
+        mask |= (uint64_t)bits << i;
     }
 
     for (; i < n; i++) {
@@ -196,11 +259,8 @@ static uint64_t neon_cmp_u32(const uint32_t* a, const uint32_t* b,
         uint32x4_t va = vld1q_u32(a + i);
         uint32x4_t vb = vld1q_u32(b + i);
         uint32x4_t eq = vceqq_u32(va, vb);
-        uint32x4_t shifted = vshrq_n_u32(eq, 31);
-        uint64_t bits = vgetq_lane_u64(vreinterpretq_u64_u32(shifted), 0);
-        for (int k = 0; k < 4; k++) {
-            if ((bits >> (k * 16)) & 1) mask |= (uint64_t)1 << (i + k);
-        }
+        uint32_t bits = neon_mask_u32(eq);
+        mask |= (uint64_t)bits << i;
     }
 
     for (; i < n; i++) {
@@ -219,10 +279,8 @@ static uint64_t neon_cmp_u64(const uint64_t* a, const uint64_t* b,
         uint32x4_t va = vld1q_u32((const uint32_t*)(a + i));
         uint32x4_t vb = vld1q_u32((const uint32_t*)(b + i));
         uint32x4_t eq = vceqq_u32(va, vb);
-        uint64_t lo = vgetq_lane_u64(vreinterpretq_u64_u32(eq), 0);
-        uint64_t hi = vgetq_lane_u64(vreinterpretq_u64_u32(eq), 1);
-        if (lo == 0xFFFFFFFFFFFFFFFFULL) mask |= (uint64_t)1 << i;
-        if (hi == 0xFFFFFFFFFFFFFFFFULL) mask |= (uint64_t)1 << (i + 1);
+        uint32_t bits = neon_mask_u64_pair(eq);
+        mask |= (uint64_t)bits << i;
     }
 
     for (; i < n; i++) {
@@ -240,22 +298,32 @@ static uint64_t neon_popcount(const void* buf, size_t n) {
     uint64_t total = 0;
     size_t i = 0;
 
+    /* Vector SWAR popcount: three shift-and-mask steps on 16 bytes at
+     * a time, then accumulate. The intermediate values fit in uint8_t
+     * because the maximum popcount of one byte is 8, and the
+     * accumulator lane can hold up to 255 before wrapping. */
     uint8x16_t acc = vdupq_n_u8(0);
-    static const uint8_t lookup_arr[16] = {
-        0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4 };
-    uint8x16_t lookup = vld1q_u8(lookup_arr);
-    uint8x16_t low_mask = vdupq_n_u8(0x0F);
+    uint8x16_t mask55 = vdupq_n_u8(0x55);
+    uint8x16_t mask33 = vdupq_n_u8(0x33);
+    uint8x16_t mask0F = vdupq_n_u8(0x0F);
 
     for (; i + 16 <= n; i += 16) {
         uint8x16_t v = vld1q_u8(p + i);
-        uint8x16_t lo = vandq_u8(v, low_mask);
-        uint8x16_t hi = vandq_u8(vshrq_n_u8(v, 4), low_mask);
-        uint8x16_t pcnt = vaddq_u8(vqtbl1q_u8(lookup, lo),
-            vqtbl1q_u8(lookup, hi));
-        acc = vaddq_u8(acc, pcnt);
+        uint8x16_t v1 = vsubq_u8(v, vandq_u8(vshrq_n_u8(v, 1), mask55));
+        uint8x16_t v2 = vaddq_u8(vandq_u8(v1, mask33),
+            vandq_u8(vshrq_n_u8(v1, 2), mask33));
+        uint8x16_t v3 = vandq_u8(vaddq_u8(v2, vshrq_n_u8(v2, 4)), mask0F);
+        acc = vaddq_u8(acc, v3);
     }
 
-    total += (uint64_t)vaddvq_u8(acc);
+    /* Horizontal sum: widen to 16-bit lanes before adding across the
+     * vector. vaddvq_u8 returns uint8_t and wraps modulo 256 when the
+     * total exceeds 255, which happens for any buffer longer than
+     * about 64 bytes. Widening to u16 keeps the sum exact. */
+    uint16x8_t lo16 = vmovl_u8(vget_low_u8(acc));
+    uint16x8_t hi16 = vmovl_u8(vget_high_u8(acc));
+    uint16x8_t sum16 = vaddq_u16(lo16, hi16);
+    total += (uint64_t)vaddvq_u16(sum16);
 
     for (; i < n; i++) {
         total += (uint64_t)simd_popcount8(p[i]);
@@ -269,9 +337,7 @@ static void neon_bit_and(void* dst, const void* a, const void* b, size_t n) {
     const uint8_t* pb = (const uint8_t*)b;
     size_t i = 0;
     for (; i + 16 <= n; i += 16) {
-        uint8x16_t va = vld1q_u8(pa + i);
-        uint8x16_t vb = vld1q_u8(pb + i);
-        vst1q_u8(d + i, vandq_u8(va, vb));
+        vst1q_u8(d + i, vandq_u8(vld1q_u8(pa + i), vld1q_u8(pb + i)));
     }
     for (; i < n; i++) d[i] = pa[i] & pb[i];
 }
@@ -282,9 +348,7 @@ static void neon_bit_or(void* dst, const void* a, const void* b, size_t n) {
     const uint8_t* pb = (const uint8_t*)b;
     size_t i = 0;
     for (; i + 16 <= n; i += 16) {
-        uint8x16_t va = vld1q_u8(pa + i);
-        uint8x16_t vb = vld1q_u8(pb + i);
-        vst1q_u8(d + i, vorrq_u8(va, vb));
+        vst1q_u8(d + i, vorrq_u8(vld1q_u8(pa + i), vld1q_u8(pb + i)));
     }
     for (; i < n; i++) d[i] = pa[i] | pb[i];
 }
@@ -295,9 +359,7 @@ static void neon_bit_xor(void* dst, const void* a, const void* b, size_t n) {
     const uint8_t* pb = (const uint8_t*)b;
     size_t i = 0;
     for (; i + 16 <= n; i += 16) {
-        uint8x16_t va = vld1q_u8(pa + i);
-        uint8x16_t vb = vld1q_u8(pb + i);
-        vst1q_u8(d + i, veorq_u8(va, vb));
+        vst1q_u8(d + i, veorq_u8(vld1q_u8(pa + i), vld1q_u8(pb + i)));
     }
     for (; i < n; i++) d[i] = pa[i] ^ pb[i];
 }
@@ -309,9 +371,7 @@ static void neon_bit_andnot(void* dst, const void* a, const void* b,
     const uint8_t* pb = (const uint8_t*)b;
     size_t i = 0;
     for (; i + 16 <= n; i += 16) {
-        uint8x16_t va = vld1q_u8(pa + i);
-        uint8x16_t vb = vld1q_u8(pb + i);
-        vst1q_u8(d + i, vbicq_u8(va, vb));
+        vst1q_u8(d + i, vbicq_u8(vld1q_u8(pa + i), vld1q_u8(pb + i)));
     }
     for (; i < n; i++) d[i] = pa[i] & ~pb[i];
 }
