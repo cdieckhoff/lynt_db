@@ -215,7 +215,7 @@ static _m_size_t align_down(_m_size_t v, _m_size_t granularity) {
 _m_ptr_result_t _m_map(void* addr, _m_size_t len, int prot, int flags,
     _m_handle_t h, _m_size_t offset) {
     _m_clear_error();
-
+    (void)flags;
     if (h == _M_HANDLE_INVALID) {
         _M_RETURN_ERR_PTR(_M_ERR_INVALID_ARG, "_m_map: invalid handle");
     }

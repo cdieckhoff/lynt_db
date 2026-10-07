@@ -37,7 +37,7 @@
  */
 
 #include "m/_m.h"
-
+#include <stdlib.h>
 #include <string.h>
 
 #ifdef _WIN32

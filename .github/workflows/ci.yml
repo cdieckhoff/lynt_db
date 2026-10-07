@@ -9,13 +9,59 @@ on:
 
 jobs:
   build-and-test:
-    name: ${{ matrix.os }} / ${{ matrix.build_type }}
+    name: ${{ matrix.os }} / ${{ matrix.arch }} / ${{ matrix.build_type }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ ubuntu-latest, macos-latest, windows-latest ]
-        build_type: [ Debug, Release ]
+        include:
+          # Linux x64
+          - os: ubuntu-latest
+            arch: x64
+            build_type: Debug
+          - os: ubuntu-latest
+            arch: x64
+            build_type: Release
+
+          # Linux ARM64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+            build_type: Debug
+          - os: ubuntu-24.04-arm
+            arch: arm64
+            build_type: Release
+
+          # Windows x64
+          - os: windows-latest
+            arch: x64
+            build_type: Debug
+          - os: windows-latest
+            arch: x64
+            build_type: Release
+
+          # Windows ARM64
+          - os: windows-11-arm
+            arch: arm64
+            build_type: Debug
+          - os: windows-11-arm
+            arch: arm64
+            build_type: Release
+
+          # macOS ARM64 (Apple Silicon)
+          - os: macos-latest
+            arch: arm64
+            build_type: Debug
+          - os: macos-latest
+            arch: arm64
+            build_type: Release
+
+          # macOS x64 (Intel)
+          - os: macos-15-intel
+            arch: x64
+            build_type: Debug
+          - os: macos-15-intel
+            arch: x64
+            build_type: Release
 
     steps:
       - name: Checkout
@@ -34,6 +80,6 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: test-log-${{ matrix.os }}-${{ matrix.build_type }}
+          name: test-log-${{ matrix.os }}-${{ matrix.arch }}-${{ matrix.build_type }}
           path: build/Testing/Temporary/LastTest.log
           if-no-files-found: ignore

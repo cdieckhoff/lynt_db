@@ -11,8 +11,12 @@
       "name": "base",
       "hidden": true,
       "generator": "Ninja",
-      "binaryDir": "${sourceDir}/build/${presetName}",
-      "installDir": "${sourceDir}/build/install/${presetName}",
+      "architecture": {
+        "value": "x64",
+        "strategy": "external"
+      },
+      "binaryDir": "${sourceDir}/build/${presetName}/${hostSystemName}",
+      "installDir": "${sourceDir}/build/${presetName}/${hostSystemName}/install",
       "cacheVariables": {
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
       }
@@ -20,8 +24,7 @@
 
     {
       "name": "debug",
-      "displayName": "Debug (all platforms)",
-      "description": "Debug build with tests and error messages enabled",
+      "displayName": "Debug",
       "inherits": "base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
@@ -33,8 +36,7 @@
 
     {
       "name": "release",
-      "displayName": "Release (all platforms)",
-      "description": "Release build, tests off, error messages off",
+      "displayName": "Release",
       "inherits": "base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
@@ -46,8 +48,7 @@
 
     {
       "name": "relwithdebinfo",
-      "displayName": "RelWithDebInfo (all platforms)",
-      "description": "Optimized with debug symbols",
+      "displayName": "RelWithDebInfo",
       "inherits": "base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
